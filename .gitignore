@@ -1,0 +1,16 @@
+# Go executables
+*.exe
+
+# Generated resource files
+rsrc.syso
+
+# Application logs
+logs/
+
+# OS specific files
+Thumbs.db
+.DS_Store
+
+# IDE and editor files
+.vscode/
+.idea/
