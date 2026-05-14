@@ -33,12 +33,14 @@ type ScriptConfig struct {
 }
 
 type Config struct {
-	Scripts   []ScriptConfig
-	NodePath  string
-	EnableLog bool
-	LogFile   string
-	AutoStart bool
-	Delay     int
+	Scripts    []ScriptConfig
+	NodePath   string
+	EnableLog  bool
+	LogFile    string
+	AutoStart  bool
+	Delay      int
+	RetryCount int
+	RetryDelay int
 }
 
 type ServerInstance struct {
@@ -50,6 +52,7 @@ type ServerInstance struct {
 	MRestart  *systray.MenuItem
 	MOpenLog  *systray.MenuItem
 	IsRunning bool
+	startGen  int64
 	mu        sync.Mutex
 }
 
@@ -327,6 +330,8 @@ func loadConfig() {
 	config.LogFile = cfg.Section("APP").Key("LogFile").MustString("logs/app.log")
 	config.AutoStart = cfg.Section("APP").Key("AutoStart").MustBool(true)
 	config.Delay = cfg.Section("APP").Key("Delay").MustInt(0)
+	config.RetryCount = cfg.Section("APP").Key("RetryCount").MustInt(0)
+	config.RetryDelay = cfg.Section("APP").Key("RetryDelay").MustInt(5)
 
 	if config.NodePath == "" {
 		config.NodePath = "node"
@@ -352,7 +357,20 @@ func saveConfig() {
 
 func (s *ServerInstance) Start() {
 	s.mu.Lock()
+	s.startGen++
+	gen := s.startGen
+	s.mu.Unlock()
+
+	s.startInternal(config.RetryCount, gen)
+}
+
+func (s *ServerInstance) startInternal(retriesLeft int, gen int64) {
+	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.startGen != gen {
+		return
+	}
 
 	// Check if already running
 	if s.Cmd != nil && s.Cmd.Process != nil && s.Cmd.ProcessState == nil {
@@ -386,26 +404,46 @@ func (s *ServerInstance) Start() {
 		logError(fmt.Sprintf("Failed to start server %s: %v", s.Config.Name, err))
 		s.updateState(false)
 		s.Cmd = nil
+
+		if retriesLeft > 0 {
+			logError(fmt.Sprintf("Retrying start for server %s in %d seconds (%d retries left)...", s.Config.Name, config.RetryDelay, retriesLeft))
+			go func(rem int, currentGen int64) {
+				time.Sleep(time.Duration(config.RetryDelay) * time.Second)
+				s.startInternal(rem-1, currentGen)
+			}(retriesLeft, gen)
+		}
 		return
 	}
 
 	s.updateState(true)
 	cmdObj := s.Cmd
 
-	go func(cmdToWait *exec.Cmd) {
+	go func(cmdToWait *exec.Cmd, rem int, currentGen int64) {
 		cmdToWait.Wait()
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.Cmd == cmdToWait {
+		isCurrent := (s.Cmd == cmdToWait)
+		if isCurrent {
 			s.updateState(false)
 			s.Cmd = nil
 		}
-	}(cmdObj)
+		stillValid := (s.startGen == currentGen)
+
+		if isCurrent && stillValid && rem > 0 {
+			logError(fmt.Sprintf("Server %s exited unexpectedly. Retrying in %d seconds (%d retries left)...", s.Config.Name, config.RetryDelay, rem))
+			go func(r int, cg int64) {
+				time.Sleep(time.Duration(config.RetryDelay) * time.Second)
+				s.startInternal(r, cg)
+			}(rem-1, currentGen)
+		}
+	}(cmdObj, retriesLeft, gen)
 }
 
 func (s *ServerInstance) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.startGen++
 
 	if s.Cmd != nil && s.Cmd.Process != nil {
 		if s.Cmd.ProcessState == nil {
@@ -415,6 +453,7 @@ func (s *ServerInstance) Stop() {
 	s.Cmd = nil
 	s.updateState(false)
 }
+
 
 func (s *ServerInstance) Restart() {
 	s.Stop()

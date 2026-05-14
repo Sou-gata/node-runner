@@ -12,6 +12,7 @@ NodeRunner is a lightweight, system-tray based Windows background service runner
 * **Global Controls**: Top-level actions allow starting, stopping, or restarting all configured services simultaneously.
 * **Silent Execution**: Runs processes in the background without visible console windows.
 * **Smart Separate Logging**: Automatically routes stdout/stderr for each server into dedicated, sanitized log files to prevent output interleaving.
+* **Automatic Recovery**: Configurable startup retry count and backoff delay ensure resilient service initialization if a server fails to start or crashes unexpectedly.
 * **Custom Configuration**: Highly flexible `config.ini` syntax supporting inline arrays, custom server display names, and dedicated per-service log paths.
 * **Auto-Start Integration**: Can be toggled directly from the tray menu to launch automatically with Windows.
 
@@ -64,6 +65,15 @@ LogFile = logs/app.log
 
 ; Start NodeRunner automatically with Windows (true/false)
 AutoStart = false
+
+; Optional startup delay before launching configured services on application boot (in seconds)
+Delay = 30
+
+; Optional automatic retry count if a server fails to start or exits unexpectedly
+RetryCount = 3
+
+; Optional delay interval between retry attempts (in seconds)
+RetryDelay = 5
 ```
 
 ## Building from Source
