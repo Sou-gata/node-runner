@@ -17,47 +17,54 @@ import (
 	"gopkg.in/ini.v1"
 )
 
-// ===============================
 // EMBED TRAY ICON
-// ===============================
 
 //go:embed icon.ico
 var iconData []byte
 
-// ===============================
 // CONFIG STRUCT
-// ===============================
 
-type Config struct {
-	ScriptPath string
-	NodePath   string
-	EnableLog  bool
-	LogFile    string
-	AutoStart  bool
+type ScriptConfig struct {
+	Path    string
+	Name    string
+	LogFile string
 }
 
-// ===============================
+type Config struct {
+	Scripts   []ScriptConfig
+	NodePath  string
+	EnableLog bool
+	LogFile   string
+	AutoStart bool
+}
+
+type ServerInstance struct {
+	Config    ScriptConfig
+	Cmd       *exec.Cmd
+	MenuItem  *systray.MenuItem
+	MStart    *systray.MenuItem
+	MStop     *systray.MenuItem
+	MRestart  *systray.MenuItem
+	MOpenLog  *systray.MenuItem
+	IsRunning bool
+}
+
 // GLOBALS
-// ===============================
 
 var (
-	cmd         *exec.Cmd
+	servers     []*ServerInstance
 	config      Config
 	mutexHandle windows.Handle
 )
 
-// ===============================
 // MAIN
-// ===============================
 
 func main() {
 	enforceSingleInstance()
 	systray.Run(onReady, onExit)
 }
 
-// ===============================
 // SINGLE INSTANCE CHECK
-// ===============================
 
 func enforceSingleInstance() {
 	mutexName, err := windows.UTF16PtrFromString("NodeRunner_SingleInstance_Mutex_Lock")
@@ -73,9 +80,7 @@ func enforceSingleInstance() {
 	}
 }
 
-// ===============================
 // ON READY
-// ===============================
 
 func onReady() {
 
@@ -90,29 +95,60 @@ func onReady() {
 		registerStartup()
 	}
 
-	err := startNodeProcess()
-	if err != nil {
-		logError(err.Error())
+	// MENU ITEMS
+
+	mRestartAll := systray.AddMenuItem(
+		"Restart All Services",
+		"Restart all running Node.js services",
+	)
+
+	mStopAll := systray.AddMenuItem(
+		"Stop All Services",
+		"Stop all running Node.js services",
+	)
+
+	mStartAll := systray.AddMenuItem(
+		"Start All Services",
+		"Start all configured Node.js services",
+	)
+
+	systray.AddSeparator()
+
+	// Create submenus for each individual server
+	for _, sc := range config.Scripts {
+		inst := &ServerInstance{
+			Config: sc,
+		}
+
+		inst.MenuItem = systray.AddMenuItem("🔴 "+sc.Name, "Server: "+sc.Name)
+		inst.MStart = inst.MenuItem.AddSubMenuItem("Start", "Start "+sc.Name)
+		inst.MStop = inst.MenuItem.AddSubMenuItem("Stop", "Stop "+sc.Name)
+		inst.MRestart = inst.MenuItem.AddSubMenuItem("Restart", "Restart "+sc.Name)
+		inst.MOpenLog = inst.MenuItem.AddSubMenuItem("Open Log", "View log for "+sc.Name)
+
+		servers = append(servers, inst)
+
+		// Start background listener for this instance's menu clicks
+		go func(srv *ServerInstance) {
+			for {
+				select {
+				case <-srv.MStart.ClickedCh:
+					srv.Start()
+				case <-srv.MStop.ClickedCh:
+					srv.Stop()
+				case <-srv.MRestart.ClickedCh:
+					srv.Restart()
+				case <-srv.MOpenLog.ClickedCh:
+					openFile(srv.Config.LogFile)
+				}
+			}
+		}(inst)
 	}
 
-	// ===============================
-	// MENU ITEMS
-	// ===============================
-
-	mRestart := systray.AddMenuItem(
-		"Restart Service",
-		"Restart Node.js service",
-	)
-
-	mStop := systray.AddMenuItem(
-		"Stop Service",
-		"Stop Node.js service",
-	)
-
-	mStart := systray.AddMenuItem(
-		"Start Service",
-		"Start Node.js service",
-	)
+	// Initially start all configured servers
+	for _, srv := range servers {
+		srv.Start()
+	}
 
 	systray.AddSeparator()
 
@@ -125,9 +161,9 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mOpenLog := systray.AddMenuItem(
-		"Open Log",
-		"Open application log",
+	mOpenLogFolder := systray.AddMenuItem(
+		"Open Logs Folder",
+		"Open directory containing all server logs",
 	)
 
 	mOpenConfig := systray.AddMenuItem(
@@ -142,24 +178,25 @@ func onReady() {
 		"Exit application",
 	)
 
-	// ===============================
-	// MENU EVENTS
-	// ===============================
+	// GLOBAL MENU EVENTS
 
 	go func() {
 		for {
 			select {
 
-			case <-mRestart.ClickedCh:
-				restartProcess()
+			case <-mRestartAll.ClickedCh:
+				for _, srv := range servers {
+					srv.Restart()
+				}
 
-			case <-mStop.ClickedCh:
-				stopProcess()
+			case <-mStopAll.ClickedCh:
+				for _, srv := range servers {
+					srv.Stop()
+				}
 
-			case <-mStart.ClickedCh:
-				err := startNodeProcess()
-				if err != nil {
-					logError(err.Error())
+			case <-mStartAll.ClickedCh:
+				for _, srv := range servers {
+					srv.Start()
 				}
 
 			// Handle Auto Start Toggle
@@ -175,14 +212,16 @@ func onReady() {
 				}
 				saveConfig() // Save the new setting to config.ini
 
-			case <-mOpenLog.ClickedCh:
-				openFile(config.LogFile)
+			case <-mOpenLogFolder.ClickedCh:
+				exec.Command("explorer", "logs").Start()
 
 			case <-mOpenConfig.ClickedCh:
 				openFile("config.ini")
 
 			case <-mExit.ClickedCh:
-				stopProcess()
+				for _, srv := range servers {
+					srv.Stop()
+				}
 				systray.Quit()
 				return
 			}
@@ -190,37 +229,82 @@ func onReady() {
 	}()
 }
 
-// ===============================
 // ON EXIT
-// ===============================
 
 func onExit() {
-	stopProcess()
+	for _, srv := range servers {
+		srv.Stop()
+	}
 	if mutexHandle != 0 {
 		windows.CloseHandle(mutexHandle)
 	}
 }
 
-// ===============================
 // CREATE REQUIRED FOLDERS
-// ===============================
 
 func createRequiredFolders() {
 	os.MkdirAll("logs", os.ModePerm)
 }
 
-// ===============================
 // LOAD & SAVE CONFIG
-// ===============================
 
 func loadConfig() {
-	cfg, err := ini.Load("config.ini")
+	cfg, err := ini.LoadSources(ini.LoadOptions{AllowShadows: true}, "config.ini")
 	if err != nil {
 		logError(err.Error())
 		return
 	}
 
-	config.ScriptPath = strings.TrimSpace(cfg.Section("APP").Key("ScriptPath").String())
+	var scripts []ScriptConfig
+	if cfg.Section("APP").HasKey("ScriptPath") {
+		for _, val := range cfg.Section("APP").Key("ScriptPath").ValueWithShadows() {
+			// Split by comma in case multiple are defined inline
+			parts := strings.Split(val, ",")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+
+				// Check for optional name and log file using pipe '|'
+				subParts := strings.SplitN(part, "|", 3)
+				path := strings.TrimSpace(subParts[0])
+				name := ""
+				logFile := ""
+				if len(subParts) > 1 {
+					name = strings.TrimSpace(subParts[1])
+				}
+				if len(subParts) > 2 {
+					logFile = strings.TrimSpace(subParts[2])
+				}
+
+				if path != "" {
+					if name == "" {
+						base := filepath.Base(path)
+						dir := filepath.Base(filepath.Dir(path))
+						if dir == "." || dir == "\\" || dir == "/" {
+							name = base
+						} else {
+							name = dir + "/" + base
+						}
+					}
+
+					if logFile == "" {
+						// Create unique sanitized log file name for this server
+						sanitized := strings.ReplaceAll(name, "/", "_")
+						sanitized = strings.ReplaceAll(sanitized, "\\", "_")
+						sanitized = strings.ReplaceAll(sanitized, " ", "_")
+						sanitized = strings.ReplaceAll(sanitized, ":", "_")
+						logFile = filepath.Join("logs", sanitized+".log")
+					}
+
+					scripts = append(scripts, ScriptConfig{Path: path, Name: name, LogFile: logFile})
+				}
+			}
+		}
+	}
+	config.Scripts = scripts
+
 	config.NodePath = strings.TrimSpace(cfg.Section("APP").Key("NodePath").String())
 	config.EnableLog = cfg.Section("APP").Key("EnableLogging").MustBool(true)
 	config.LogFile = cfg.Section("APP").Key("LogFile").MustString("logs/app.log")
@@ -233,13 +317,11 @@ func loadConfig() {
 
 // Added function to save config back to file
 func saveConfig() {
-	cfg, err := ini.Load("config.ini")
+	cfg, err := ini.LoadSources(ini.LoadOptions{AllowShadows: true}, "config.ini")
 	if err != nil {
-		// If file doesn't exist for some reason, create an empty one
 		cfg = ini.Empty()
 	}
 
-	// Update the AutoStart key
 	cfg.Section("APP").Key("AutoStart").SetValue(strconv.FormatBool(config.AutoStart))
 
 	err = cfg.SaveTo("config.ini")
@@ -248,71 +330,88 @@ func saveConfig() {
 	}
 }
 
-// ===============================
-// START & STOP PROCESS
-// ===============================
+// SERVER INSTANCE LOGIC
 
-func startNodeProcess() error {
-	if cmd != nil && cmd.Process != nil {
-		return nil
+func (s *ServerInstance) Start() {
+	// Check if already running
+	if s.Cmd != nil && s.Cmd.Process != nil && s.Cmd.ProcessState == nil {
+		return
 	}
 
-	if config.ScriptPath == "" {
-		return fmt.Errorf("ScriptPath missing in config.ini")
-	}
-
-	absScriptPath, err := filepath.Abs(config.ScriptPath)
+	absPath, err := filepath.Abs(s.Config.Path)
 	if err != nil {
-		return err
+		logError(fmt.Sprintf("Failed to resolve absolute path for %s: %v", s.Config.Path, err))
+		return
 	}
 
-	cmd = exec.Command(config.NodePath, absScriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	s.Cmd = exec.Command(config.NodePath, absPath)
+	s.Cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	if config.EnableLog {
-		logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+		os.MkdirAll(filepath.Dir(s.Config.LogFile), os.ModePerm)
+		logFile, err := os.OpenFile(s.Config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
 		if err == nil {
 			writer := io.MultiWriter(logFile)
-			cmd.Stdout = writer
-			cmd.Stderr = writer
+			s.Cmd.Stdout = writer
+			s.Cmd.Stderr = writer
+		} else {
+			logError(fmt.Sprintf("Failed to open log file %s for server %s: %v", s.Config.LogFile, s.Config.Name, err))
 		}
 	}
 
-	err = cmd.Start()
+	err = s.Cmd.Start()
 	if err != nil {
-		cmd = nil
-		return err
+		logError(fmt.Sprintf("Failed to start server %s: %v", s.Config.Name, err))
+		s.updateState(false)
+		return
 	}
 
-	go func() {
-		cmd.Wait()
-		cmd = nil
-	}()
+	s.updateState(true)
 
-	return nil
+	go func(cmdObj *exec.Cmd) {
+		cmdObj.Wait()
+		s.updateState(false)
+	}(s.Cmd)
 }
 
-func stopProcess() {
-	if cmd != nil && cmd.Process != nil {
-		err := cmd.Process.Kill()
-		if err != nil {
-			logError(err.Error())
+func (s *ServerInstance) Stop() {
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		if s.Cmd.ProcessState == nil {
+			s.Cmd.Process.Kill()
 		}
-		cmd = nil
+	}
+	s.updateState(false)
+}
+
+func (s *ServerInstance) Restart() {
+	s.Stop()
+	s.Start()
+}
+
+func (s *ServerInstance) updateState(running bool) {
+	s.IsRunning = running
+	if s.MenuItem != nil {
+		if running {
+			s.MenuItem.SetTitle("🟢 " + s.Config.Name)
+			if s.MStart != nil {
+				s.MStart.Disable()
+			}
+			if s.MStop != nil {
+				s.MStop.Enable()
+			}
+		} else {
+			s.MenuItem.SetTitle("🔴 " + s.Config.Name)
+			if s.MStart != nil {
+				s.MStart.Enable()
+			}
+			if s.MStop != nil {
+				s.MStop.Disable()
+			}
+		}
 	}
 }
 
-func restartProcess() {
-	stopProcess()
-	err := startNodeProcess()
-	if err != nil {
-		logError(err.Error())
-	}
-}
-
-// ===============================
 // WINDOWS STARTUP REGISTRY
-// ===============================
 
 func registerStartup() {
 	exePath, err := os.Executable()
@@ -369,9 +468,7 @@ func unregisterStartup() {
 	}
 }
 
-// ===============================
 // UTILS
-// ===============================
 
 func logError(msg string) {
 	f, err := os.OpenFile("logs/error.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
