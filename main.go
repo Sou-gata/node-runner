@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
@@ -36,6 +38,7 @@ type Config struct {
 	EnableLog bool
 	LogFile   string
 	AutoStart bool
+	Delay     int
 }
 
 type ServerInstance struct {
@@ -47,6 +50,7 @@ type ServerInstance struct {
 	MRestart  *systray.MenuItem
 	MOpenLog  *systray.MenuItem
 	IsRunning bool
+	mu        sync.Mutex
 }
 
 // GLOBALS
@@ -60,6 +64,10 @@ var (
 // MAIN
 
 func main() {
+	if exePath, err := os.Executable(); err == nil {
+		os.Chdir(filepath.Dir(exePath))
+	}
+
 	enforceSingleInstance()
 	systray.Run(onReady, onExit)
 }
@@ -146,8 +154,17 @@ func onReady() {
 	}
 
 	// Initially start all configured servers
-	for _, srv := range servers {
-		srv.Start()
+	if config.Delay > 0 {
+		go func() {
+			time.Sleep(time.Duration(config.Delay) * time.Second)
+			for _, srv := range servers {
+				srv.Start()
+			}
+		}()
+	} else {
+		for _, srv := range servers {
+			srv.Start()
+		}
 	}
 
 	systray.AddSeparator()
@@ -309,6 +326,7 @@ func loadConfig() {
 	config.EnableLog = cfg.Section("APP").Key("EnableLogging").MustBool(true)
 	config.LogFile = cfg.Section("APP").Key("LogFile").MustString("logs/app.log")
 	config.AutoStart = cfg.Section("APP").Key("AutoStart").MustBool(true)
+	config.Delay = cfg.Section("APP").Key("Delay").MustInt(0)
 
 	if config.NodePath == "" {
 		config.NodePath = "node"
@@ -333,6 +351,9 @@ func saveConfig() {
 // SERVER INSTANCE LOGIC
 
 func (s *ServerInstance) Start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Check if already running
 	if s.Cmd != nil && s.Cmd.Process != nil && s.Cmd.ProcessState == nil {
 		return
@@ -345,6 +366,7 @@ func (s *ServerInstance) Start() {
 	}
 
 	s.Cmd = exec.Command(config.NodePath, absPath)
+	s.Cmd.Dir = filepath.Dir(absPath)
 	s.Cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	if config.EnableLog {
@@ -363,23 +385,34 @@ func (s *ServerInstance) Start() {
 	if err != nil {
 		logError(fmt.Sprintf("Failed to start server %s: %v", s.Config.Name, err))
 		s.updateState(false)
+		s.Cmd = nil
 		return
 	}
 
 	s.updateState(true)
+	cmdObj := s.Cmd
 
-	go func(cmdObj *exec.Cmd) {
-		cmdObj.Wait()
-		s.updateState(false)
-	}(s.Cmd)
+	go func(cmdToWait *exec.Cmd) {
+		cmdToWait.Wait()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.Cmd == cmdToWait {
+			s.updateState(false)
+			s.Cmd = nil
+		}
+	}(cmdObj)
 }
 
 func (s *ServerInstance) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.Cmd != nil && s.Cmd.Process != nil {
 		if s.Cmd.ProcessState == nil {
 			s.Cmd.Process.Kill()
 		}
 	}
+	s.Cmd = nil
 	s.updateState(false)
 }
 
